@@ -3,6 +3,11 @@
 A presentation-ready Streamlit MVP with a PostgreSQL analytics dashboard and a
 read-only natural-language database agent.
 
+The natural-language interface can also return end-user-friendly charts and
+trend projections. Projection questions fetch historical monthly data with
+read-only SQL, then calculate future values in Python using a recent linear
+trend.
+
 ## Quick start
 
 1. Open a terminal in this folder.
@@ -33,14 +38,18 @@ read-only natural-language database agent.
 ## Expected database fields
 
 The defaults target a `member_accounts` table containing `status`, `amount`,
-`network`, `channel`, `created_at`, and `product_code`. Every name and status
-value can be changed in `.env` to match an existing database.
+`target_amount`, `network`, `channel`, `created_at`, and `product_code`. Every
+name and status value can be changed in `.env` to match an existing database.
+Generated target-amount analytics exclude invalid text and per-account targets
+above `MAX_TARGET_AMOUNT`, which defaults to 10,000,000,000.
 
 ## Demo checklist
 
 - Confirm the sidebar says **Database connected**.
 - Open the dashboard and explain the five metrics and four visualizations.
 - Open **Ask Database** and run two prepared questions.
+- Ask for a six-month registration projection and explain the historical versus
+  projected lines and the estimate disclaimer.
 - Expand the generated SQL and result table while explaining the read-only guard.
 - Finish on **About** to show the system architecture.
 

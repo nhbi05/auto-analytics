@@ -36,6 +36,10 @@ def column_name(setting: str, default: str) -> str:
 def _database_url() -> str | URL:
     explicit_url = os.getenv("DATABASE_URL")
     if explicit_url:
+        if explicit_url.startswith("postgres://"):
+            return explicit_url.replace("postgres://", "postgresql+psycopg://", 1)
+        if explicit_url.startswith("postgresql://"):
+            return explicit_url.replace("postgresql://", "postgresql+psycopg://", 1)
         return explicit_url
 
     return URL.create(
@@ -78,7 +82,7 @@ def run_readonly_query(sql: str, *, max_rows: int = 200) -> pd.DataFrame:
         transaction = connection.begin()
         try:
             connection.execute(text("SET TRANSACTION READ ONLY"))
-            connection.execute(text("SET LOCAL statement_timeout = '10s'"))
+            connection.execute(text("SET LOCAL statement_timeout = '30s'"))
             result = pd.read_sql_query(text(wrapped_sql), connection)
         finally:
             transaction.rollback()

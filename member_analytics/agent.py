@@ -6,12 +6,14 @@ import json
 import os
 import re
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 
 import pandas as pd
 import requests
 from openai import AuthenticationError, OpenAI
 
 from database import get_table_schema, run_readonly_query, table_name
+from forecasting import grouped_monthly_forecast, linear_monthly_forecast
 from prompts import ANSWER_SYSTEM_PROMPT, SQL_SYSTEM_PROMPT
 
 _BLOCKED_SQL = re.compile(
@@ -26,6 +28,12 @@ class AgentResult:
     answer: str
     sql: str
     data: pd.DataFrame
+    analysis_type: str = "query"
+    chart_type: str = "none"
+    chart_title: str = ""
+    x_column: str = ""
+    y_column: str = ""
+    chart_data: pd.DataFrame | None = None
 
 
 def _schema_text() -> str:
@@ -53,6 +61,136 @@ def _extract_json(content: str) -> dict[str, str]:
     return payload
 
 
+def _projection_periods(
+    payload: dict[str, object],
+    question: str = "",
+) -> int:
+    numbered_horizon = re.search(
+        r"\bnext\s+(\d+)\s+(month|months|year|years)\b",
+        question,
+        re.IGNORECASE,
+    )
+    if numbered_horizon:
+        periods = int(numbered_horizon.group(1))
+        if numbered_horizon.group(2).lower().startswith("year"):
+            periods *= 12
+        return min(max(periods, 1), 24)
+    if re.search(r"\bnext\s+month\b", question, re.IGNORECASE):
+        return 1
+    if re.search(r"\bnext\s+year\b", question, re.IGNORECASE):
+        return 12
+    try:
+        periods = int(payload.get("projection_periods", 6))
+    except (TypeError, ValueError):
+        periods = 6
+    return min(max(periods, 1), 24)
+
+
+def _requests_projection(question: str) -> bool:
+    """Return whether the user explicitly requests future estimation."""
+    return bool(
+        re.search(
+            r"\b(forecast|forecasting|project|projected|projection|predict|"
+            r"prediction|estimate|estimated|future|expected)\b"
+            r"|\bnext\s+\d+\s+(month|months|year|years)\b"
+            r"|\bwhat\s+will\b",
+            question,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _requests_grouped_projection(question: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(channel|network|status|product|purpose|category|type)\b",
+            question,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _projection_data(
+    data: pd.DataFrame,
+    *,
+    grouped: bool,
+) -> pd.DataFrame | None:
+    if not {"period", "value"}.issubset(data.columns):
+        return None
+    normalized = data.copy()
+    if not grouped:
+        return normalized
+    if "series" in normalized.columns:
+        return normalized
+    candidates = [
+        column for column in normalized.columns if column not in {"period", "value"}
+    ]
+    if len(candidates) != 1:
+        return None
+    return normalized.rename(columns={candidates[0]: "series"})
+
+
+def _projection_window(
+    data: pd.DataFrame,
+    requested_periods: int,
+    *,
+    current_date: pd.Timestamp | None = None,
+) -> tuple[pd.Timestamp, int]:
+    parsed_periods = pd.to_datetime(data["period"], errors="coerce").dropna()
+    if parsed_periods.empty:
+        raise ValueError("The projection query returned no valid monthly dates.")
+    last_historical = parsed_periods.max().to_period("M")
+    current_month = (
+        current_date if current_date is not None else pd.Timestamp.now()
+    ).to_period("M")
+    first_target = max(current_month + 1, last_historical + 1)
+    bridge_periods = first_target.ordinal - last_historical.ordinal
+    calculation_periods = bridge_periods + requested_periods - 1
+    if calculation_periods > 120:
+        raise ValueError(
+            "The historical data is too old to produce a reliable projection "
+            "for the requested calendar period."
+        )
+    return first_target.to_timestamp(), calculation_periods
+
+
+def _chart_settings(
+    payload: dict[str, object],
+    data: pd.DataFrame,
+) -> tuple[str, str, str, str]:
+    chart_type = str(payload.get("chart_type", "none")).lower()
+    x_column = str(payload.get("x_column", ""))
+    y_column = str(payload.get("y_column", ""))
+    title = str(payload.get("chart_title", "Results"))
+    paired_charts = {
+        "bar",
+        "line",
+        "pie",
+        "donut",
+        "area",
+        "scatter",
+        "funnel",
+    }
+    if (
+        chart_type in paired_charts
+        and x_column in data.columns
+        and y_column in data.columns
+        and len(data) >= 2
+    ):
+        return chart_type, x_column, y_column, title
+    if chart_type == "histogram" and len(data) >= 2:
+        value_column = x_column if x_column in data.columns else y_column
+        if value_column in data.columns:
+            return chart_type, value_column, "", title
+    if chart_type == "box" and len(data) >= 2:
+        if x_column in data.columns and y_column in data.columns:
+            return chart_type, x_column, y_column, title
+        value_column = x_column if x_column in data.columns else y_column
+        if value_column in data.columns:
+            return chart_type, value_column, "", title
+    return "none", "", "", ""
+
+
 def _validate_sql(sql: str) -> str:
     normalized = sql.strip().rstrip(";").strip()
     without_comments = re.sub(r"/\*.*?\*/|--[^\n]*", " ", normalized, flags=re.DOTALL)
@@ -63,6 +201,168 @@ def _validate_sql(sql: str) -> str:
     if ";" in without_comments:
         raise ValueError("Only one SQL statement is allowed.")
     return normalized
+
+
+def _is_grouping_error(exc: Exception) -> bool:
+    """Return whether a database exception contains PostgreSQL SQLSTATE 42803."""
+    current: object | None = exc
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        sqlstate = getattr(current, "sqlstate", None) or getattr(
+            current, "pgcode", None
+        )
+        if sqlstate == "42803":
+            return True
+        current = getattr(current, "orig", None)
+    return False
+
+
+def _mentions_identifier(sql: str, identifier: str) -> bool:
+    pattern = rf'(?<![A-Za-z0-9_])"?{re.escape(identifier)}"?(?![A-Za-z0-9_])'
+    return bool(re.search(pattern, sql, re.IGNORECASE))
+
+
+def _allows_non_successful_amount(question: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(failed|failure|rejected|pending|attempted|unsuccessful)\b"
+            r"|\bby\s+status\b|\beach\s+status\b|\ball\s+statuses\b",
+            question,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _contains_numeric_literal(sql: str, expected: str) -> bool:
+    try:
+        expected_value = Decimal(expected)
+    except InvalidOperation:
+        return False
+    tokens = re.findall(
+        r"(?<![A-Za-z0-9_.])(?:[0-9]+(?:[.][0-9]*)?|[.][0-9]+)"
+        r"(?:[eE][+-]?[0-9]+)?(?![A-Za-z0-9_.])",
+        sql,
+    )
+    for token in tokens:
+        try:
+            if Decimal(token) == expected_value:
+                return True
+        except InvalidOperation:
+            continue
+    return False
+
+
+def _ensure_monetary_query_rules(
+    generated: dict[str, str],
+    *,
+    prompt: str,
+    question: str,
+) -> dict[str, str]:
+    sql = _validate_sql(generated["sql"])
+    monetary_columns = [
+        column.strip()
+        for column in os.getenv(
+            "MONETARY_COLUMNS",
+            "amount,target_amount",
+        ).split(",")
+        if column.strip()
+    ]
+    status_column = os.getenv("STATUS_COLUMN", "status")
+    approved_value = os.getenv("APPROVED_VALUE", "approved")
+    target_column = os.getenv("TARGET_AMOUNT_COLUMN", "target_amount")
+    max_target = os.getenv("MAX_TARGET_AMOUNT", "10000000000")
+    used_columns = [
+        column for column in monetary_columns if _mentions_identifier(sql, column)
+    ]
+    if not used_columns:
+        return generated
+    requires_success = not _allows_non_successful_amount(question)
+    success_filter_ok = not requires_success or (
+        _mentions_identifier(sql, status_column)
+        and approved_value.casefold() in sql.casefold()
+    )
+    uses_target = target_column in used_columns
+    target_limit_ok = not uses_target or _contains_numeric_literal(sql, max_target)
+    target_parse_ok = not uses_target or (
+        "~" in sql or "regexp_replace" in sql.casefold()
+    )
+    if success_filter_ok and target_limit_ok and target_parse_ok:
+        return generated
+
+    missing_rules = []
+    if not success_filter_ok:
+        missing_rules.append(
+            f"filter rows to successful status {approved_value!r}"
+        )
+    if not target_parse_ok:
+        missing_rules.append(
+            f"safely validate text in {target_column!r} before casting it"
+        )
+    if not target_limit_ok:
+        missing_rules.append(
+            f"restrict parsed {target_column!r} values to 0 through {max_target}"
+        )
+    repair_request = (
+        f"Original user question: {question}\n"
+        f"Rejected SQL: {sql}\n"
+        "The monetary query violates required business or data-quality rules: "
+        f"{'; '.join(missing_rules)}. Return the same JSON structure with "
+        "corrected SQL. Apply every rule before aggregation, charting, or "
+        "projection."
+    )
+    repaired = _extract_json(_chat(prompt, repair_request))
+    repaired_sql = _validate_sql(repaired["sql"])
+    repaired_success_ok = not requires_success or (
+        _mentions_identifier(repaired_sql, status_column)
+        and approved_value.casefold() in repaired_sql.casefold()
+    )
+    repaired_target_ok = not uses_target or (
+        _contains_numeric_literal(repaired_sql, max_target)
+        and ("~" in repaired_sql or "regexp_replace" in repaired_sql.casefold())
+    )
+    if not repaired_success_ok or not repaired_target_ok:
+        raise ValueError(
+            "The generated monetary query did not satisfy the required status "
+            "and data-quality rules."
+        )
+    return repaired
+
+
+def _run_generated_query(
+    generated: dict[str, str],
+    *,
+    prompt: str,
+    question: str,
+) -> tuple[dict[str, str], str, pd.DataFrame]:
+    generated = _ensure_monetary_query_rules(
+        generated,
+        prompt=prompt,
+        question=question,
+    )
+    sql = _validate_sql(generated["sql"])
+    try:
+        return generated, sql, run_readonly_query(sql)
+    except Exception as exc:
+        if not _is_grouping_error(exc):
+            raise
+
+    repair_request = (
+        f"Original user question: {question}\n"
+        f"Rejected SQL: {sql}\n"
+        "PostgreSQL rejected the GROUP BY clause with SQLSTATE 42803. "
+        "Return the same JSON structure with corrected SQL. Group derived "
+        "SELECT expressions by ordinal position (for example GROUP BY 1) or "
+        "repeat the full expression; do not group by an output alias."
+    )
+    repaired = _extract_json(_chat(prompt, repair_request))
+    repaired = _ensure_monetary_query_rules(
+        repaired,
+        prompt=prompt,
+        question=question,
+    )
+    repaired_sql = _validate_sql(repaired["sql"])
+    return repaired, repaired_sql, run_readonly_query(repaired_sql)
 
 
 def _provider() -> str:
@@ -193,15 +493,144 @@ def ask_database(question: str) -> AgentResult:
     if not question.strip():
         raise ValueError("Enter a question about the database.")
 
-    prompt = SQL_SYSTEM_PROMPT.format(table=table_name(), schema=_schema_text())
+    prompt = SQL_SYSTEM_PROMPT.format(
+        table=table_name(),
+        schema=_schema_text(),
+        approved_value=os.getenv("APPROVED_VALUE", "approved"),
+        pending_value=os.getenv("PENDING_VALUE", "pending"),
+        rejected_value=os.getenv("REJECTED_VALUE", "rejected"),
+        monetary_columns=os.getenv("MONETARY_COLUMNS", "amount,target_amount"),
+        target_amount_column=os.getenv(
+            "TARGET_AMOUNT_COLUMN",
+            "target_amount",
+        ),
+        max_target_amount=os.getenv("MAX_TARGET_AMOUNT", "10000000000"),
+    )
     generated = _extract_json(_chat(prompt, question))
-    sql = _validate_sql(generated["sql"])
-    data = run_readonly_query(sql)
+    generated, sql, data = _run_generated_query(
+        generated,
+        prompt=prompt,
+        question=question,
+    )
+    requested_analysis = str(generated.get("analysis_type", "query")).lower()
+    analysis_type = (
+        "projection"
+        if requested_analysis == "projection" and _requests_projection(question)
+        else "query"
+    )
+
+    if analysis_type == "projection":
+        grouped_projection = _requests_grouped_projection(question)
+        normalized_data = _projection_data(data, grouped=grouped_projection)
+        if normalized_data is None:
+            required_columns = (
+                '"period", "series", and "value"'
+                if grouped_projection
+                else '"period" and "value"'
+            )
+            repair_request = (
+                f"Original user question: {question}\n"
+                f"Rejected SQL: {sql}\n"
+                "The projection SQL returned the wrong result shape. Return "
+                "the same JSON structure with corrected historical monthly SQL "
+                f"whose exact result aliases are {required_columns}. "
+                'Alias the category as "series" for a grouped comparison. '
+                "Do not calculate future rows in SQL."
+            )
+            repaired = _extract_json(_chat(prompt, repair_request))
+            generated, sql, data = _run_generated_query(
+                repaired,
+                prompt=prompt,
+                question=question,
+            )
+            normalized_data = _projection_data(
+                data,
+                grouped=grouped_projection,
+            )
+            if normalized_data is None:
+                raise ValueError(
+                    "The projection query must return historical monthly "
+                    f"columns {required_columns}."
+                )
+
+        requested_periods = _projection_periods(generated, question)
+        first_target, calculation_periods = _projection_window(
+            normalized_data,
+            requested_periods,
+        )
+        if grouped_projection:
+            projection = grouped_monthly_forecast(
+                normalized_data,
+                date_column="period",
+                series_column="series",
+                value_column="value",
+                periods=calculation_periods,
+            )
+        else:
+            projection = linear_monthly_forecast(
+                normalized_data,
+                date_column="period",
+                value_column="value",
+                periods=calculation_periods,
+            )
+        answer_data = projection.forecast[
+            projection.forecast["period"] >= first_target
+        ].copy()
+        chart_title = str(generated.get("chart_title", "Trend projection"))
+        answer_context = (
+            f"Analysis type: projection\n"
+            f"Question: {question}\n"
+            f"Method: Linear trend fitted independently to up to 24 recent "
+            f"complete monthly values"
+            f"{' for each series' if grouped_projection else ''}.\n"
+            f"Projection: {_result_text(answer_data)}"
+        )
+        try:
+            answer = _chat(
+                ANSWER_SYSTEM_PROMPT,
+                answer_context,
+                temperature=0.1,
+            ).strip()
+        except Exception:
+            if grouped_projection:
+                final_period = answer_data["period"].max()
+                winner = (
+                    answer_data[answer_data["period"] == final_period]
+                    .sort_values("projected_value", ascending=False)
+                    .iloc[0]
+                )
+                answer = (
+                    f"{winner['series']} is expected to have the most "
+                    f"enrollments in {final_period.strftime('%B %Y')}, with a "
+                    f"trend-based estimate of "
+                    f"{winner['projected_value']:,.0f}."
+                )
+            else:
+                final_row = answer_data.iloc[-1]
+                answer = (
+                    f"The trend-based estimate for "
+                    f"{final_row['period'].strftime('%B %Y')} is "
+                    f"{final_row['projected_value']:,.0f}."
+                )
+        return AgentResult(
+            answer=answer,
+            sql=sql,
+            data=answer_data,
+            analysis_type="projection",
+            chart_type="line",
+            chart_title=chart_title,
+            x_column="period",
+            y_column="projected_value",
+            chart_data=projection.chart_data,
+        )
 
     try:
         answer = _chat(
             ANSWER_SYSTEM_PROMPT,
-            f"Question: {question}\nSQL: {sql}\nResult: {_result_text(data)}",
+            f"Analysis type: query\n"
+            f"Question: {question}\n"
+            f"SQL: {sql}\n"
+            f"Result: {_result_text(data)}",
             temperature=0.1,
         ).strip()
     except Exception:
@@ -211,4 +640,14 @@ def ask_database(question: str) -> AgentResult:
             else f"The query returned {len(data):,} result row(s)."
         )
 
-    return AgentResult(answer=answer, sql=sql, data=data)
+    chart_type, x_column, y_column, chart_title = _chart_settings(generated, data)
+    return AgentResult(
+        answer=answer,
+        sql=sql,
+        data=data,
+        chart_type=chart_type,
+        chart_title=chart_title,
+        x_column=x_column,
+        y_column=y_column,
+        chart_data=data if chart_type != "none" else None,
+    )

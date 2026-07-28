@@ -33,7 +33,8 @@ def get_summary_metrics() -> dict[str, float | int]:
             COALESCE(
                 SUM(
                     CASE
-                        WHEN {cleaned_amount} ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                        WHEN LOWER(CAST({status} AS TEXT)) = LOWER(:approved)
+                         AND {cleaned_amount} ~ '^-?[0-9]+(\\.[0-9]+)?$'
                         THEN {cleaned_amount}::numeric
                         ELSE 0
                     END
