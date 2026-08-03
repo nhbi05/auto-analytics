@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pandas as pd
@@ -12,7 +13,9 @@ from agent import (
     _allows_non_successful_amount,
     _chart_settings,
     _contains_numeric_literal,
+    _chat,
     _is_grouping_error,
+    _requests_bank_analysis,
     _projection_window,
     _projection_periods,
     _requests_projection,
@@ -27,6 +30,53 @@ class _PostgresGroupingError(Exception):
 class _DatabaseError(Exception):
     def __init__(self) -> None:
         self.orig = _PostgresGroupingError()
+
+
+class ProviderTests(unittest.TestCase):
+    @patch("agent.AzureOpenAI")
+    def test_azure_provider_uses_chat_deployment(self, azure_client) -> None:
+        azure_client.return_value.chat.completions.create.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="connected"))]
+        )
+        env = {
+            "LLM_PROVIDER": "azure",
+            "AZURE_OPENAI_ENDPOINT": "https://example.openai.azure.com/",
+            "AZURE_OPENAI_API_KEY": "secret",
+            "AZURE_OPENAI_API_VERSION": "2024-10-21",
+            "AZURE_OPENAI_CHAT_DEPLOYMENT": "analytics-chat",
+        }
+
+        with patch.dict("os.environ", env, clear=True):
+            result = _chat("system", "user")
+
+        self.assertEqual(result, "connected")
+        azure_client.assert_called_once_with(
+            azure_endpoint=env["AZURE_OPENAI_ENDPOINT"],
+            api_key=env["AZURE_OPENAI_API_KEY"],
+            api_version=env["AZURE_OPENAI_API_VERSION"],
+        )
+        call = azure_client.return_value.chat.completions.create.call_args
+        self.assertEqual(call.kwargs["model"], "analytics-chat")
+        self.assertNotIn("temperature", call.kwargs)
+
+    @patch("agent.AzureOpenAI")
+    def test_azure_provider_accepts_legacy_deployment_name(self, azure_client) -> None:
+        azure_client.return_value.chat.completions.create.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="connected"))]
+        )
+        env = {
+            "LLM_PROVIDER": "azure",
+            "AZURE_OPENAI_ENDPOINT": "https://example.openai.azure.com/",
+            "AZURE_OPENAI_API_KEY": "secret",
+            "AZURE_OPENAI_API_VERSION": "2024-10-21",
+            "AZURE_OPENAI_DEPLOYMENT": "fallback-chat",
+        }
+
+        with patch.dict("os.environ", env, clear=True):
+            _chat("system", "user")
+
+        call = azure_client.return_value.chat.completions.create.call_args
+        self.assertEqual(call.kwargs["model"], "fallback-chat")
 
 
 class GeneratedQueryTests(unittest.TestCase):
@@ -127,6 +177,11 @@ class GeneratedQueryTests(unittest.TestCase):
         self.assertTrue(_allows_non_successful_amount("Show failed amounts"))
         self.assertTrue(_allows_non_successful_amount("Compare amount by status"))
 
+    def test_recognizes_bank_questions(self) -> None:
+        self.assertTrue(_requests_bank_analysis("Which bank is used most?"))
+        self.assertTrue(_requests_bank_analysis("Compare banking providers"))
+        self.assertFalse(_requests_bank_analysis("Which channel is used most?"))
+
     def test_recognizes_equivalent_target_limit_literals(self) -> None:
         self.assertTrue(
             _contains_numeric_literal(
@@ -187,6 +242,59 @@ class GeneratedQueryTests(unittest.TestCase):
         self.assertIn("GROUP BY 1", result.sql)
         self.assertEqual(run_query.call_count, 2)
         self.assertIn("SQLSTATE 42803", chat.call_args_list[1].args[1])
+
+    @patch(
+        "agent._schema_text",
+        return_value="- banking_details: text",
+    )
+    @patch("agent.table_name", return_value="member_accounts")
+    @patch("agent.run_readonly_query")
+    @patch("agent._chat")
+    def test_repairs_bank_query_that_groups_raw_json(
+        self,
+        chat,
+        run_query,
+        _table_name,
+        _schema,
+    ) -> None:
+        generated = {
+            "sql": (
+                "SELECT banking_details AS bank, COUNT(*) AS count "
+                "FROM member_accounts GROUP BY 1 ORDER BY 2 DESC"
+            ),
+            "reasoning": "Count banking details",
+            "analysis_type": "query",
+            "projection_periods": 6,
+            "chart_type": "bar",
+            "x_column": "bank",
+            "y_column": "count",
+            "chart_title": "Most Used Bank",
+        }
+        repaired = {
+            **generated,
+            "sql": (
+                "WITH banks AS (SELECT NULLIF(TRIM("
+                "banking_details::jsonb ->> 'BankName'), '') AS bank "
+                "FROM member_accounts) "
+                "SELECT bank, COUNT(*) AS count FROM banks "
+                "WHERE bank IS NOT NULL GROUP BY 1 ORDER BY 2 DESC"
+            ),
+        }
+        chat.side_effect = [
+            json.dumps(generated),
+            json.dumps(repaired),
+            "MTN is the most used provider, with 64,138 accounts.",
+        ]
+        run_query.return_value = pd.DataFrame(
+            {"bank": ["MTN", "AIRTEL"], "count": [64138, 39221]}
+        )
+
+        result = ask_database("Which bank is used most?")
+
+        self.assertIn("->> 'BankName'", result.sql)
+        self.assertEqual(result.x_column, "bank")
+        self.assertEqual(result.data.iloc[0]["bank"], "MTN")
+        run_query.assert_called_once_with(repaired["sql"])
 
     @patch("agent._schema_text", return_value="- amount: numeric\n- status: text")
     @patch("agent.table_name", return_value="member_accounts")

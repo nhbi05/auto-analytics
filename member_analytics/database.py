@@ -97,9 +97,9 @@ def test_connection() -> tuple[bool, str]:
         return False, str(exc)
 
 
-def get_table_schema() -> pd.DataFrame:
+def get_table_schema(configured_table: str | None = None) -> pd.DataFrame:
     """Return column metadata for the configured member table."""
-    configured_table = table_name()
+    configured_table = configured_table or table_name()
     if "." in configured_table:
         schema, table = configured_table.split(".", maxsplit=1)
     else:

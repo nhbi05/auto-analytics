@@ -10,7 +10,7 @@ from decimal import Decimal, InvalidOperation
 
 import pandas as pd
 import requests
-from openai import AuthenticationError, OpenAI
+from openai import AuthenticationError, AzureOpenAI, OpenAI
 
 from database import get_table_schema, run_readonly_query, table_name
 from forecasting import grouped_monthly_forecast, linear_monthly_forecast
@@ -36,11 +36,16 @@ class AgentResult:
     chart_data: pd.DataFrame | None = None
 
 
-def _schema_text() -> str:
-    schema = get_table_schema()
+def _schema_text(configured_table: str | None = None) -> str:
+    schema = (
+        get_table_schema(configured_table)
+        if configured_table
+        else get_table_schema()
+    )
     if schema.empty:
         raise ValueError(
-            f"Table {table_name()!r} was not found. Check MEMBER_TABLE in .env."
+            f"Table {(configured_table or table_name())!r} was not found. "
+            "Check the table configuration in .env."
         )
     return "\n".join(
         f"- {row.column_name}: {row.data_type} (nullable: {row.is_nullable})"
@@ -234,6 +239,59 @@ def _allows_non_successful_amount(question: str) -> bool:
     )
 
 
+def _requests_bank_analysis(question: str) -> bool:
+    """Return whether the question asks about a bank or banking provider."""
+    return bool(re.search(r"\bbank(?:ing|s)?\b", question, re.IGNORECASE))
+
+
+def _bank_query_is_normalized(sql: str) -> bool:
+    """Check that JSON banking details are reduced to a usable bank name."""
+    lowered = sql.casefold()
+    extracts_bank_name = (
+        _mentions_identifier(sql, "banking_details")
+        and "bankname" in lowered
+        and ("->>" in sql or "jsonb_extract_path_text" in lowered)
+    )
+    excludes_missing_names = (
+        "nullif" in lowered
+        and "trim" in lowered
+        and "is not null" in lowered
+    )
+    return extracts_bank_name and excludes_missing_names
+
+
+def _ensure_bank_query_rules(
+    generated: dict[str, str],
+    *,
+    prompt: str,
+    question: str,
+) -> dict[str, str]:
+    """Repair bank analytics that group the raw JSON document."""
+    if not _requests_bank_analysis(question):
+        return generated
+    sql = _validate_sql(generated["sql"])
+    if _bank_query_is_normalized(sql):
+        return generated
+
+    repair_request = (
+        f"Original user question: {question}\n"
+        f"Rejected SQL: {sql}\n"
+        "The banking_details column contains JSON serialized as text. Return "
+        "the same JSON structure with corrected SQL that extracts the scalar "
+        'bank name with banking_details::jsonb ->> \'BankName\', normalizes it '
+        "with TRIM, and excludes null and empty bank names before aggregation. "
+        "Group and chart the extracted bank-name alias, never the raw JSON "
+        "document. Preserve the requested ranking and limit."
+    )
+    repaired = _extract_json(_chat(prompt, repair_request))
+    repaired_sql = _validate_sql(repaired["sql"])
+    if not _bank_query_is_normalized(repaired_sql):
+        raise ValueError(
+            "The generated bank query did not extract and filter valid bank names."
+        )
+    return repaired
+
+
 def _contains_numeric_literal(sql: str, expected: str) -> bool:
     try:
         expected_value = Decimal(expected)
@@ -335,6 +393,11 @@ def _run_generated_query(
     prompt: str,
     question: str,
 ) -> tuple[dict[str, str], str, pd.DataFrame]:
+    generated = _ensure_bank_query_rules(
+        generated,
+        prompt=prompt,
+        question=question,
+    )
     generated = _ensure_monetary_query_rules(
         generated,
         prompt=prompt,
@@ -378,6 +441,25 @@ def _openai_api_key() -> str:
     return api_key
 
 
+def _required_env(name: str) -> str:
+    value = os.getenv(name, "").strip().strip("\"'")
+    if not value:
+        raise ValueError(f"{name} is missing from .env.")
+    return value
+
+
+def _azure_chat_deployment() -> str:
+    deployment = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT", "").strip().strip("\"'")
+    if not deployment:
+        deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "").strip().strip("\"'")
+    if not deployment:
+        raise ValueError(
+            "AZURE_OPENAI_CHAT_DEPLOYMENT or AZURE_OPENAI_DEPLOYMENT is missing "
+            "from .env."
+        )
+    return deployment
+
+
 def _github_token() -> str:
     token = os.getenv("GITHUB_TOKEN", "").strip().strip("\"'")
     if not token:
@@ -396,11 +478,34 @@ def _groq_api_key() -> str:
 
 def _chat(system_prompt: str, user_prompt: str, *, temperature: float = 0) -> str:
     provider = _provider()
+    if provider == "azure":
+        model = _azure_chat_deployment()
+        client = AzureOpenAI(
+            azure_endpoint=_required_env("AZURE_OPENAI_ENDPOINT"),
+            api_key=_required_env("AZURE_OPENAI_API_KEY"),
+            api_version=_required_env("AZURE_OPENAI_API_VERSION"),
+        )
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+        except AuthenticationError as exc:
+            raise ValueError(
+                "Azure OpenAI rejected the API key. Check the Azure endpoint, "
+                "API key, API version, and chat deployment, then restart Streamlit."
+            ) from exc
+        return response.choices[0].message.content or ""
+
     if provider == "openai":
+        model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
         client = OpenAI(api_key=_openai_api_key())
         try:
             response = client.chat.completions.create(
-                model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
+                model=model,
                 temperature=temperature,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -415,6 +520,7 @@ def _chat(system_prompt: str, user_prompt: str, *, temperature: float = 0) -> st
         return response.choices[0].message.content or ""
 
     if provider == "github":
+        model = os.getenv("GITHUB_MODEL", "openai/gpt-4.1-mini")
         response = requests.post(
             "https://models.github.ai/inference/chat/completions",
             headers={
@@ -423,7 +529,7 @@ def _chat(system_prompt: str, user_prompt: str, *, temperature: float = 0) -> st
                 "X-GitHub-Api-Version": "2026-03-10",
             },
             json={
-                "model": os.getenv("GITHUB_MODEL", "openai/gpt-4.1-mini"),
+                "model": model,
                 "temperature": temperature,
                 "messages": [
                     {"role": "system", "content": system_prompt},
@@ -441,13 +547,14 @@ def _chat(system_prompt: str, user_prompt: str, *, temperature: float = 0) -> st
         return str(response.json()["choices"][0]["message"]["content"])
 
     if provider == "groq":
+        model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
         client = OpenAI(
             api_key=_groq_api_key(),
             base_url="https://api.groq.com/openai/v1",
         )
         try:
             response = client.chat.completions.create(
-                model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+                model=model,
                 temperature=temperature,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -462,10 +569,11 @@ def _chat(system_prompt: str, user_prompt: str, *, temperature: float = 0) -> st
         return response.choices[0].message.content or ""
 
     if provider == "ollama":
+        model = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
         response = requests.post(
             f"{os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434').rstrip('/')}/api/chat",
             json={
-                "model": os.getenv("OLLAMA_MODEL", "llama3.1:8b"),
+                "model": model,
                 "stream": False,
                 "options": {"temperature": temperature},
                 "messages": [
@@ -479,7 +587,7 @@ def _chat(system_prompt: str, user_prompt: str, *, temperature: float = 0) -> st
         return str(response.json()["message"]["content"])
 
     raise ValueError(
-        "LLM_PROVIDER must be 'groq', 'openai', 'github', or 'ollama'."
+        "LLM_PROVIDER must be 'azure', 'groq', 'openai', 'github', or 'ollama'."
     )
 
 
@@ -489,13 +597,40 @@ def _result_text(data: pd.DataFrame) -> str:
     return data.head(20).to_json(orient="records", date_format="iso")
 
 
-def ask_database(question: str) -> AgentResult:
+def ask_database(question: str, *, target_table: str | None = None) -> AgentResult:
     if not question.strip():
         raise ValueError("Enter a question about the database.")
 
+    configured_table = target_table or table_name()
+    schema_text = _schema_text(target_table)
+    if configured_table.lower().endswith("smartlife_contributions"):
+        schema_text += (
+            "\n\nBenefits data rules:"
+            "\n- member_name = 'Suspense' is a pooled/system placeholder, not an "
+            "individual contributor. Exclude it from top/highest contributor or "
+            "member rankings."
+            "\n- Identify an individual contributor by nssf_number. For a named "
+            "ranking, group by nssf_number and use MAX(member_name) as the display "
+            "name; do not group unrelated contributors only by member_name."
+            "\n- Distinguish transaction from contributor questions: 'highest "
+            "contribution' or 'largest contribution' means the single largest "
+            "successful paid_amount row; 'highest contributor', 'top contributor', "
+            "or 'highest total contribution by member' means SUM(paid_amount) "
+            "grouped by nssf_number."
+            "\n- If the user asks for the highest/top contributor AND 'their "
+            "contributions', first find the top nssf_number by total successful "
+            "paid_amount in a CTE, then return every SUCCESS transaction for that "
+            "nssf_number as separate rows. Include nssf_number, member_name, "
+            "record_date, partner_id, vendor, approved_date, paid_amount, and the "
+            "contributor's total as a window value. Do not return only one "
+            "aggregated row."
+            "\n- Treat paid_amount as the contribution amount and, unless the user "
+            "asks otherwise, include only status = 'SUCCESS' when totaling paid "
+            "contributions."
+        )
     prompt = SQL_SYSTEM_PROMPT.format(
-        table=table_name(),
-        schema=_schema_text(),
+        table=configured_table,
+        schema=schema_text,
         approved_value=os.getenv("APPROVED_VALUE", "approved"),
         pending_value=os.getenv("PENDING_VALUE", "pending"),
         rejected_value=os.getenv("REJECTED_VALUE", "rejected"),

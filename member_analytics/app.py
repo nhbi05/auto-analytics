@@ -100,7 +100,7 @@ def load_dashboard_data():
 
 
 def dashboard_page() -> None:
-    header("Analytics Dashboard", "Live insights from PostgreSQL member-account data")
+    header("Analytics Dashboard", "Live insights from the SmartLife database")
     try:
         metrics, status, network, monthly, channel = load_dashboard_data()
     except Exception as exc:
@@ -326,11 +326,6 @@ def render_answer_chart(result) -> None:
 
 
 def ask_page() -> None:
-    header(
-        "Ask the Database",
-        "Ask for an answer, a graph, or a future projection in plain language",
-    )
-
     selected = st.selectbox(
         "Try a demonstration question",
         ["Write my own question...", *DEMO_QUESTIONS],

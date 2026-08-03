@@ -10,6 +10,29 @@ trend.
 
 ## Quick start
 
+### FastAPI and React
+
+Install the Python dependencies, then start the API from this directory:
+
+```powershell
+pip install -r requirements.txt
+uvicorn api:app --reload
+```
+
+In a second terminal, start the React application:
+
+```powershell
+cd frontend
+npm install
+npm run dev
+```
+
+Open `http://localhost:5173`. Interactive API documentation is available at
+`http://localhost:8000/docs`. For production, set `CORS_ORIGINS` to a
+comma-separated list of allowed frontend origins.
+
+### Legacy Streamlit interface
+
 1. Open a terminal in this folder.
 2. Create and activate a virtual environment:
 
@@ -25,7 +48,10 @@ trend.
    ```
 
 4. Update `.env` with the PostgreSQL credentials, real table/column names, and
-   a Groq, OpenAI, GitHub Models, or Ollama configuration.
+   an Azure OpenAI, Groq, OpenAI, GitHub Models, or Ollama configuration.
+   For Azure OpenAI, set `LLM_PROVIDER=azure` and provide
+   `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`,
+   `AZURE_OPENAI_API_VERSION`, and `AZURE_OPENAI_CHAT_DEPLOYMENT`.
    For Groq, paste the key into `GROQ_API_KEY` and keep `LLM_PROVIDER=groq`.
    For GitHub Models, paste the PAT into `GITHUB_TOKEN` and keep
    `LLM_PROVIDER=github`.

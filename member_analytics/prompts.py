@@ -18,6 +18,11 @@ Rules:
 - When asked for the number of accounts, records, registrations, applications,
   or members, use COUNT(*) unless the user explicitly asks for unique people.
 - Do not use COUNT(DISTINCT member_name) as a synonym for account count.
+- The banking_details column contains a JSON object serialized as text. For
+  bank questions, extract the scalar bank name with
+  banking_details::jsonb ->> 'BankName'. Apply TRIM and NULLIF, exclude null or
+  empty bank names before aggregation, and group/chart the extracted bank-name
+  alias. Never return, group, or chart the complete banking_details JSON object.
 - All monetary metrics, including amount, income, revenue, collections, and
   monetary projections, use only rows whose status matches the configured
   approved value. Exclude pending and failed/rejected rows unless the user

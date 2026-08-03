@@ -108,3 +108,79 @@ def get_monthly_registrations() -> pd.DataFrame:
         ORDER BY 1
         """
     )
+
+
+def _benefits_table() -> str:
+    return quote_identifier(
+        os.getenv("BENEFITS_TABLE", "public.smartlife_contributions")
+    )
+
+
+def get_benefits_summary() -> dict[str, float | int]:
+    result = run_query(
+        f"""
+        SELECT
+            COUNT(*) AS total_contributions,
+            COUNT(DISTINCT nssf_number) AS contributing_members,
+            COUNT(*) FILTER (WHERE UPPER(COALESCE(status, '')) = 'SUCCESS') AS successful,
+            COUNT(*) FILTER (WHERE UPPER(COALESCE(status, '')) = 'PENDING') AS pending,
+            COALESCE(
+                SUM(paid_amount) FILTER (
+                    WHERE UPPER(COALESCE(status, '')) = 'SUCCESS'
+                ),
+                0
+            ) AS total_paid
+        FROM {_benefits_table()}
+        """
+    )
+    row = result.iloc[0]
+    return {
+        "total_contributions": int(row["total_contributions"] or 0),
+        "contributing_members": int(row["contributing_members"] or 0),
+        "successful": int(row["successful"] or 0),
+        "pending": int(row["pending"] or 0),
+        "total_paid": float(row["total_paid"] or 0),
+    }
+
+
+def get_benefits_status_distribution() -> pd.DataFrame:
+    return run_query(
+        f"""
+        SELECT COALESCE(status, 'Unknown') AS status, COUNT(*) AS contributions
+        FROM {_benefits_table()}
+        GROUP BY 1
+        ORDER BY contributions DESC
+        """
+    )
+
+
+def get_benefits_vendor_distribution() -> pd.DataFrame:
+    return run_query(
+        f"""
+        SELECT COALESCE(vendor, 'Unknown') AS vendor, COUNT(*) AS contributions
+        FROM {_benefits_table()}
+        GROUP BY 1
+        ORDER BY contributions DESC
+        LIMIT 12
+        """
+    )
+
+
+def get_monthly_benefits() -> pd.DataFrame:
+    return run_query(
+        f"""
+        SELECT
+            DATE_TRUNC('month', record_date)::date AS month,
+            COUNT(*) AS contributions,
+            COALESCE(
+                SUM(paid_amount) FILTER (
+                    WHERE UPPER(COALESCE(status, '')) = 'SUCCESS'
+                ),
+                0
+            ) AS paid_amount
+        FROM {_benefits_table()}
+        WHERE record_date IS NOT NULL
+        GROUP BY 1
+        ORDER BY 1
+        """
+    )
