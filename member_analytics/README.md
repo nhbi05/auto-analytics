@@ -1,25 +1,26 @@
 # Natural Language Analytics System
 
-A presentation-ready Streamlit MVP with a PostgreSQL analytics dashboard and a
-read-only natural-language database agent.
+A Django and React analytics application backed by PostgreSQL. It provides
+predefined dashboards, safe natural-language database queries, charts, and
+trend projections.
 
-The natural-language interface can also return end-user-friendly charts and
-trend projections. Projection questions fetch historical monthly data with
-read-only SQL, then calculate future values in Python using a recent linear
-trend.
+## Local development
 
-## Quick start
-
-### FastAPI and React
-
-Install the Python dependencies, then start the API from this directory:
+Create and activate a virtual environment, then install the Python packages:
 
 ```powershell
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-uvicorn api:app --reload
 ```
 
-In a second terminal, start the React application:
+Start Django from this directory:
+
+```powershell
+python manage.py runserver 8000
+```
+
+In a second terminal, start React:
 
 ```powershell
 cd frontend
@@ -27,62 +28,70 @@ npm install
 npm run dev
 ```
 
-Open `http://localhost:5173`. Interactive API documentation is available at
-`http://localhost:8000/docs`. For production, set `CORS_ORIGINS` to a
-comma-separated list of allowed frontend origins.
+Open `http://localhost:5173`. Vite proxies `/api` requests to Django on port
+8000.
 
-### Legacy Streamlit interface
+## Production build
 
-1. Open a terminal in this folder.
-2. Create and activate a virtual environment:
+Build React and collect its assets for Django/WhiteNoise:
 
-   ```powershell
-   py -m venv .venv
-   .\.venv\Scripts\Activate.ps1
-   ```
+```powershell
+cd frontend
+npm ci
+npm run build
+cd ..
+python manage.py collectstatic --noinput
+python manage.py check --deploy
+```
 
-3. Install dependencies:
+Run the combined application on Windows with Waitress:
 
-   ```powershell
-   pip install -r requirements.txt
-   ```
+```powershell
+waitress-serve --listen=0.0.0.0:8000 member_analytics_project.wsgi:application
+```
 
-4. Update `.env` with the PostgreSQL credentials, real table/column names, and
-   an Azure OpenAI, Groq, OpenAI, GitHub Models, or Ollama configuration.
-   For Azure OpenAI, set `LLM_PROVIDER=azure` and provide
-   `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`,
-   `AZURE_OPENAI_API_VERSION`, and `AZURE_OPENAI_CHAT_DEPLOYMENT`.
-   For Groq, paste the key into `GROQ_API_KEY` and keep `LLM_PROVIDER=groq`.
-   For GitHub Models, paste the PAT into `GITHUB_TOKEN` and keep
-   `LLM_PROVIDER=github`.
-5. Start the application:
+On Linux, the same WSGI entry point can be hosted with Gunicorn, uWSGI, or the
+supervisor's existing Django server setup.
 
-   ```powershell
-   streamlit run app.py
-   ```
+Required production settings include:
 
-## Expected database fields
+```dotenv
+DJANGO_SECRET_KEY=replace-with-a-long-random-secret
+DJANGO_DEBUG=false
+DJANGO_ALLOWED_HOSTS=analytics.example.com,10.0.0.20
+CORS_ORIGINS=https://analytics.example.com
+```
 
-The defaults target a `member_accounts` table containing `status`, `amount`,
-`target_amount`, `network`, `channel`, `created_at`, and `product_code`. Every
-name and status value can be changed in `.env` to match an existing database.
-Generated target-amount analytics exclude invalid text and per-account targets
-above `MAX_TARGET_AMOUNT`, which defaults to 10,000,000,000.
+When Django serves the React build from the same hostname, `CORS_ORIGINS` is
+not required by the browser but may remain configured.
 
-## Demo checklist
+## Database and AI configuration
 
-- Confirm the sidebar says **Database connected**.
-- Open the dashboard and explain the five metrics and four visualizations.
-- Open **Ask Database** and run two prepared questions.
-- Ask for a six-month registration projection and explain the historical versus
-  projected lines and the estimate disclaimer.
-- Expand the generated SQL and result table while explaining the read-only guard.
-- Finish on **About** to show the system architecture.
+Update `.env` with the PostgreSQL credentials, table/column names, and an Azure
+OpenAI, Groq, OpenAI, GitHub Models, or Ollama configuration. The analytics
+queries continue to use SQLAlchemy directly; Django's small SQLite database is
+only available for Django internals and does not contain analytics data.
 
-## Presenter summary
+The default member table contains `status`, `amount`, `target_amount`,
+`network`, `channel`, `created_at`, and `product_code`. All names and status
+values can be configured in `.env`. Generated target-amount analytics exclude
+invalid text and per-account targets above `MAX_TARGET_AMOUNT`, which defaults
+to 10,000,000,000.
 
-> The system has two components. The first is an analytical engine that
-> generates predefined metrics and visualizations from PostgreSQL. The second is
-> an AI-powered natural-language interface that translates questions into safe,
-> read-only SQL, executes them, and returns both the results and a human-readable
-> explanation through the same Streamlit application.
+## API endpoints
+
+- `GET /api/health`
+- `GET /api/dashboard`
+- `GET /api/benefits`
+- `GET /api/questions?domain=enrolments|benefits`
+- `POST /api/ask`
+
+All existing React API contracts are preserved by the Django migration.
+
+## Legacy Streamlit interface
+
+The earlier Streamlit interface remains available during the transition:
+
+```powershell
+streamlit run app.py
+```

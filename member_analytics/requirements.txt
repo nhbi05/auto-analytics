@@ -1,6 +1,8 @@
 streamlit>=1.50,<2
-fastapi>=0.115,<1
-uvicorn[standard]>=0.34,<1
+Django>=5.2,<6
+django-cors-headers>=4.7,<5
+whitenoise>=6.9,<7
+waitress>=3.0,<4
 pandas>=2.2,<3
 SQLAlchemy>=2.0,<3
 psycopg[binary]>=3.2,<4

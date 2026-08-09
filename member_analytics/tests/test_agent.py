@@ -9,18 +9,22 @@ from unittest.mock import patch
 
 import pandas as pd
 
+import agent
 from agent import (
     _allows_non_successful_amount,
     _chart_settings,
     _contains_numeric_literal,
     _chat,
+    _deterministic_answer,
     _is_grouping_error,
     _requests_bank_analysis,
     _projection_window,
     _projection_periods,
+    _requests_grouped_projection,
     _requests_projection,
     ask_database,
 )
+from prompts import ANSWER_SYSTEM_PROMPT, SQL_SYSTEM_PROMPT
 
 
 class _PostgresGroupingError(Exception):
@@ -80,6 +84,21 @@ class ProviderTests(unittest.TestCase):
 
 
 class GeneratedQueryTests(unittest.TestCase):
+    def test_monthly_prompt_preserves_year_and_uses_readable_winner(self) -> None:
+        self.assertIn("Never return or group", SQL_SYSTEM_PROMPT)
+        self.assertIn("EXTRACT(MONTH FROM ...) alone", SQL_SYSTEM_PROMPT)
+        self.assertIn("June 2026", SQL_SYSTEM_PROMPT)
+
+    def test_named_month_prompt_requires_full_month_date_range(self) -> None:
+        self.assertIn("entire half-open monthly", SQL_SYSTEM_PROMPT)
+        self.assertIn(">= DATE '2026-06-01'", SQL_SYSTEM_PROMPT)
+        self.assertIn("< DATE '2026-07-01'", SQL_SYSTEM_PROMPT)
+        self.assertIn("not = DATE '2026-06-01'", SQL_SYSTEM_PROMPT)
+
+    def test_limited_results_are_not_described_as_complete_totals(self) -> None:
+        self.assertIn("When the SQL contains LIMIT", ANSWER_SYSTEM_PROMPT)
+        self.assertIn("never claim", ANSWER_SYSTEM_PROMPT)
+
     def test_historical_trend_is_not_projection_intent(self) -> None:
         self.assertFalse(
             _requests_projection(
@@ -169,6 +188,32 @@ class GeneratedQueryTests(unittest.TestCase):
                     settings,
                     (chart_type, "amount", "", "Amount distribution"),
                 )
+
+    def test_histogram_preserves_pre_binned_frequency_column(self) -> None:
+        data = pd.DataFrame(
+            [{"bin": 1, "frequency": 12}, {"bin": 2, "frequency": 4}]
+        )
+        settings = _chart_settings(
+            {
+                "chart_type": "histogram",
+                "x_column": "bin",
+                "y_column": "frequency",
+                "chart_title": "Amount distribution",
+            },
+            data,
+        )
+
+        self.assertEqual(
+            settings,
+            ("histogram", "bin", "frequency", "Amount distribution"),
+        )
+
+    def test_vendor_question_requests_grouped_projection(self) -> None:
+        self.assertTrue(
+            _requests_grouped_projection(
+                "Which vendor is expected to process the most contributions next month?"
+            )
+        )
 
     def test_only_explicit_status_analysis_can_include_unsuccessful_amounts(
         self,
@@ -521,6 +566,139 @@ class GeneratedQueryTests(unittest.TestCase):
             '"period", "series", and "value"',
             chat.call_args_list[1].args[1],
         )
+
+
+class PerformanceTests(unittest.TestCase):
+    def test_schema_text_is_cached_across_calls(self) -> None:
+        agent._schema_text.cache_clear()
+        schema = pd.DataFrame(
+            [{"column_name": "id", "data_type": "integer", "is_nullable": "NO"}]
+        )
+        with patch("agent.get_table_schema", return_value=schema) as get_schema:
+            first = agent._schema_text("member_accounts")
+            second = agent._schema_text("member_accounts")
+
+        self.assertEqual(first, second)
+        get_schema.assert_called_once_with("member_accounts")
+
+    @patch("agent.AzureOpenAI")
+    def test_azure_client_is_reused_across_chat_calls(self, azure_client) -> None:
+        agent._cached_client.cache_clear()
+        azure_client.return_value.chat.completions.create.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
+        )
+        env = {
+            "LLM_PROVIDER": "azure",
+            "AZURE_OPENAI_ENDPOINT": "https://example.openai.azure.com/",
+            "AZURE_OPENAI_API_KEY": "secret",
+            "AZURE_OPENAI_API_VERSION": "2024-10-21",
+            "AZURE_OPENAI_CHAT_DEPLOYMENT": "analytics-chat",
+        }
+
+        with patch.dict("os.environ", env, clear=True):
+            _chat("system", "first question")
+            _chat("system", "second question")
+
+        azure_client.assert_called_once()
+        self.assertEqual(
+            azure_client.return_value.chat.completions.create.call_count, 2
+        )
+
+    def test_deterministic_answer_handles_empty_and_single_row_results(self) -> None:
+        self.assertEqual(
+            _deterministic_answer(pd.DataFrame()),
+            "No matching records were found.",
+        )
+        self.assertEqual(
+            _deterministic_answer(pd.DataFrame({"total_accounts": [12450]})),
+            "Total accounts: 12,450.",
+        )
+        self.assertEqual(
+            _deterministic_answer(
+                pd.DataFrame({"status": ["approved"], "accounts": [12450]})
+            ),
+            "Status: approved; Accounts: 12,450.",
+        )
+        self.assertIsNone(
+            _deterministic_answer(
+                pd.DataFrame({"status": ["approved", "pending"], "accounts": [10, 2]})
+            )
+        )
+
+    @patch("agent._schema_text", return_value="- status: text")
+    @patch("agent.table_name", return_value="member_accounts")
+    @patch("agent.run_readonly_query")
+    @patch("agent._chat")
+    def test_ask_database_skips_second_ai_call_for_single_row_result(
+        self,
+        chat,
+        run_query,
+        _table_name,
+        _schema,
+    ) -> None:
+        generated = {
+            "sql": "SELECT COUNT(*) AS total_accounts FROM member_accounts",
+            "reasoning": "Count accounts",
+            "analysis_type": "query",
+            "projection_periods": 6,
+            "chart_type": "none",
+            "x_column": "",
+            "y_column": "",
+            "chart_title": "",
+        }
+        chat.side_effect = [json.dumps(generated)]
+        run_query.return_value = pd.DataFrame({"total_accounts": [12450]})
+
+        result = ask_database("How many approved members are there?")
+
+        self.assertEqual(result.answer, "Total accounts: 12,450.")
+        self.assertEqual(chat.call_count, 1)
+        self.assertIsNotNone(result.timings)
+        for stage in (
+            "schema_loading",
+            "sql_generation",
+            "database_execution",
+            "answer_generation",
+            "total",
+        ):
+            self.assertIn(stage, result.timings)
+
+    @patch("agent._schema_text", return_value="- member_name: text")
+    @patch(
+        "agent.table_name",
+        return_value="public.smartlife_contributions",
+    )
+    @patch("agent.run_readonly_query")
+    @patch("agent._chat")
+    def test_smartlife_prompt_requires_order_independent_name_matching(
+        self,
+        chat,
+        run_query,
+        _table_name,
+        _schema,
+    ) -> None:
+        generated = {
+            "sql": (
+                "SELECT COUNT(*) AS matches FROM public.smartlife_contributions "
+                "WHERE member_name ILIKE '%Nansereko%' "
+                "AND member_name ILIKE '%Housnah%'"
+            ),
+            "reasoning": "Match every part of the member name",
+            "analysis_type": "query",
+            "projection_periods": 6,
+            "chart_type": "none",
+            "x_column": "",
+            "y_column": "",
+            "chart_title": "",
+        }
+        chat.return_value = json.dumps(generated)
+        run_query.return_value = pd.DataFrame({"matches": [1]})
+
+        ask_database("What is Nansereko Housnah's balance?")
+
+        system_prompt = chat.call_args_list[0].args[0]
+        self.assertIn("never compare the whole member_name with =", system_prompt)
+        self.assertIn("independent of word order", system_prompt)
 
 
 if __name__ == "__main__":

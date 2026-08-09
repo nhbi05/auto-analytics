@@ -89,6 +89,48 @@ def run_readonly_query(sql: str, *, max_rows: int = 200) -> pd.DataFrame:
     return result
 
 
+def run_readonly_query_page(
+    sql: str,
+    *,
+    page: int = 1,
+    page_size: int = 50,
+) -> tuple[pd.DataFrame, int]:
+    """Return one page and the total rows from an already validated SELECT."""
+    if page < 1 or page_size < 1 or page_size > 200:
+        raise ValueError("Invalid result page or page size.")
+    clean_sql = sql.rstrip().rstrip(";")
+    count_sql = f"SELECT COUNT(*) AS total FROM ({clean_sql}) AS generated_result"
+    page_sql = (
+        f"SELECT * FROM ({clean_sql}) AS generated_result "
+        f"LIMIT {page_size} OFFSET {(page - 1) * page_size}"
+    )
+    with get_engine().connect() as connection:
+        transaction = connection.begin()
+        try:
+            connection.execute(text("SET TRANSACTION READ ONLY"))
+            connection.execute(text("SET LOCAL statement_timeout = '30s'"))
+            total = int(connection.execute(text(count_sql)).scalar_one())
+            frame = pd.read_sql_query(text(page_sql), connection)
+        finally:
+            transaction.rollback()
+    return frame, total
+
+
+def run_readonly_query_export(sql: str) -> pd.DataFrame:
+    """Run an already validated SELECT without the interactive preview cap."""
+    clean_sql = sql.rstrip().rstrip(";")
+    wrapped_sql = f"SELECT * FROM ({clean_sql}) AS generated_result"
+    with get_engine().connect() as connection:
+        transaction = connection.begin()
+        try:
+            connection.execute(text("SET TRANSACTION READ ONLY"))
+            connection.execute(text("SET LOCAL statement_timeout = '60s'"))
+            result = pd.read_sql_query(text(wrapped_sql), connection)
+        finally:
+            transaction.rollback()
+    return result
+
+
 def test_connection() -> tuple[bool, str]:
     try:
         result = run_query("SELECT current_database() AS database_name")

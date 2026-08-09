@@ -256,10 +256,18 @@ def render_answer_chart(result) -> None:
             y=result.y_column,
         )
     elif result.chart_type == "histogram":
-        figure = px.histogram(
-            result.chart_data,
-            x=result.x_column,
-        )
+        if result.y_column:
+            # Large datasets may be pre-binned by the database.
+            figure = px.bar(
+                result.chart_data,
+                x=result.x_column,
+                y=result.y_column,
+            )
+        else:
+            figure = px.histogram(
+                result.chart_data,
+                x=result.x_column,
+            )
     elif result.chart_type == "box":
         if result.y_column:
             figure = px.box(

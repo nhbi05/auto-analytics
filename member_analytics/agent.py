@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import json
+import logging
+import numbers
 import os
 import re
+import time
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from functools import lru_cache
 
 import pandas as pd
 import requests
@@ -15,6 +19,8 @@ from openai import AuthenticationError, AzureOpenAI, OpenAI
 from database import get_table_schema, run_readonly_query, table_name
 from forecasting import grouped_monthly_forecast, linear_monthly_forecast
 from prompts import ANSWER_SYSTEM_PROMPT, SQL_SYSTEM_PROMPT
+
+_LOGGER = logging.getLogger(__name__)
 
 _BLOCKED_SQL = re.compile(
     r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|GRANT|REVOKE|COPY|CALL|DO|"
@@ -34,8 +40,10 @@ class AgentResult:
     x_column: str = ""
     y_column: str = ""
     chart_data: pd.DataFrame | None = None
+    timings: dict[str, float] | None = None
 
 
+@lru_cache(maxsize=8)
 def _schema_text(configured_table: str | None = None) -> str:
     schema = (
         get_table_schema(configured_table)
@@ -108,7 +116,7 @@ def _requests_projection(question: str) -> bool:
 def _requests_grouped_projection(question: str) -> bool:
     return bool(
         re.search(
-            r"\b(channel|network|status|product|purpose|category|type)\b",
+            r"\b(channel|network|status|vendor|provider|merchant|product|purpose|category|type)\b",
             question,
             re.IGNORECASE,
         )
@@ -184,6 +192,8 @@ def _chart_settings(
     ):
         return chart_type, x_column, y_column, title
     if chart_type == "histogram" and len(data) >= 2:
+        if x_column in data.columns and y_column in data.columns:
+            return chart_type, x_column, y_column, title
         value_column = x_column if x_column in data.columns else y_column
         if value_column in data.columns:
             return chart_type, value_column, "", title
@@ -265,9 +275,10 @@ def _ensure_bank_query_rules(
     *,
     prompt: str,
     question: str,
+    schema_has_banking_details: bool,
 ) -> dict[str, str]:
     """Repair bank analytics that group the raw JSON document."""
-    if not _requests_bank_analysis(question):
+    if not schema_has_banking_details or not _requests_bank_analysis(question):
         return generated
     sql = _validate_sql(generated["sql"])
     if _bank_query_is_normalized(sql):
@@ -392,11 +403,13 @@ def _run_generated_query(
     *,
     prompt: str,
     question: str,
+    schema_has_banking_details: bool,
 ) -> tuple[dict[str, str], str, pd.DataFrame]:
     generated = _ensure_bank_query_rules(
         generated,
         prompt=prompt,
         question=question,
+        schema_has_banking_details=schema_has_banking_details,
     )
     generated = _ensure_monetary_query_rules(
         generated,
@@ -476,11 +489,19 @@ def _groq_api_key() -> str:
     return api_key
 
 
+@lru_cache(maxsize=8)
+def _cached_client(client_cls, **config: str):
+    """Build (and reuse) one client instance per class/config so HTTP connections
+    are pooled across calls instead of being re-established on every request."""
+    return client_cls(**config)
+
+
 def _chat(system_prompt: str, user_prompt: str, *, temperature: float = 0) -> str:
     provider = _provider()
     if provider == "azure":
         model = _azure_chat_deployment()
-        client = AzureOpenAI(
+        client = _cached_client(
+            AzureOpenAI,
             azure_endpoint=_required_env("AZURE_OPENAI_ENDPOINT"),
             api_key=_required_env("AZURE_OPENAI_API_KEY"),
             api_version=_required_env("AZURE_OPENAI_API_VERSION"),
@@ -502,7 +523,7 @@ def _chat(system_prompt: str, user_prompt: str, *, temperature: float = 0) -> st
 
     if provider == "openai":
         model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
-        client = OpenAI(api_key=_openai_api_key())
+        client = _cached_client(OpenAI, api_key=_openai_api_key())
         try:
             response = client.chat.completions.create(
                 model=model,
@@ -548,7 +569,8 @@ def _chat(system_prompt: str, user_prompt: str, *, temperature: float = 0) -> st
 
     if provider == "groq":
         model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-        client = OpenAI(
+        client = _cached_client(
+            OpenAI,
             api_key=_groq_api_key(),
             base_url="https://api.groq.com/openai/v1",
         )
@@ -597,12 +619,69 @@ def _result_text(data: pd.DataFrame) -> str:
     return data.head(20).to_json(orient="records", date_format="iso")
 
 
+def _humanize_column(name: str) -> str:
+    return name.replace("_", " ").strip().capitalize()
+
+
+def _format_scalar(value: object) -> str:
+    try:
+        if value is None or pd.isna(value):
+            return "none"
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, numbers.Number):
+        number = float(value)
+        if number == int(number):
+            return f"{int(number):,}"
+        return f"{number:,.2f}"
+    return str(value)
+
+
+def _deterministic_answer(data: pd.DataFrame) -> str | None:
+    """Build a concise answer directly from a single-row result without an AI
+    call. Multi-row breakdowns still go through the AI explainer, since those
+    benefit more from prose summarization."""
+    if data.empty:
+        return "No matching records were found."
+    if len(data) != 1:
+        return None
+    row = data.iloc[0]
+    if len(data.columns) == 1:
+        column = data.columns[0]
+        return f"{_humanize_column(column)}: {_format_scalar(row[column])}."
+    parts = [
+        f"{_humanize_column(column)}: {_format_scalar(row[column])}"
+        for column in data.columns
+    ]
+    return "; ".join(parts) + "."
+
+
+def _elapsed(start: float) -> float:
+    return round(time.perf_counter() - start, 3)
+
+
 def ask_database(question: str, *, target_table: str | None = None) -> AgentResult:
     if not question.strip():
         raise ValueError("Enter a question about the database.")
 
+    total_start = time.perf_counter()
+    timings: dict[str, float] = {}
+
     configured_table = target_table or table_name()
+    schema_start = time.perf_counter()
     schema_text = _schema_text(target_table)
+    timings["schema_loading"] = _elapsed(schema_start)
+    schema_has_banking_details = "banking_details" in schema_text.lower()
+    if schema_has_banking_details:
+        schema_text += (
+            "\n\nBanking data rules:"
+            "\n- The banking_details column contains a JSON object serialized "
+            "as text. For bank questions, extract the scalar bank name with "
+            "banking_details::jsonb ->> 'BankName'. Apply TRIM and NULLIF, "
+            "exclude null or empty bank names before aggregation, and "
+            "group/chart the extracted bank-name alias. Never return, group, "
+            "or chart the complete banking_details JSON object."
+        )
     if configured_table.lower().endswith("smartlife_contributions"):
         schema_text += (
             "\n\nBenefits data rules:"
@@ -612,6 +691,12 @@ def ask_database(question: str, *, target_table: str | None = None) -> AgentResu
             "\n- Identify an individual contributor by nssf_number. For a named "
             "ranking, group by nssf_number and use MAX(member_name) as the display "
             "name; do not group unrelated contributors only by member_name."
+            "\n- When filtering for a person named by the user, never compare the "
+            "whole member_name with = or with one ordered string. Split the supplied "
+            "name into words and require every word independently with "
+            "member_name ILIKE '%word%'. For example, 'Nansereko Housnah' must use "
+            "member_name ILIKE '%Nansereko%' AND member_name ILIKE '%Housnah%'. "
+            "This makes name matching case-insensitive and independent of word order."
             "\n- Distinguish transaction from contributor questions: 'highest "
             "contribution' or 'largest contribution' means the single largest "
             "successful paid_amount row; 'highest contributor', 'top contributor', "
@@ -641,12 +726,18 @@ def ask_database(question: str, *, target_table: str | None = None) -> AgentResu
         ),
         max_target_amount=os.getenv("MAX_TARGET_AMOUNT", "10000000000"),
     )
+    sql_generation_start = time.perf_counter()
     generated = _extract_json(_chat(prompt, question))
+    timings["sql_generation"] = _elapsed(sql_generation_start)
+
+    database_start = time.perf_counter()
     generated, sql, data = _run_generated_query(
         generated,
         prompt=prompt,
         question=question,
+        schema_has_banking_details=schema_has_banking_details,
     )
+    timings["database_execution"] = _elapsed(database_start)
     requested_analysis = str(generated.get("analysis_type", "query")).lower()
     analysis_type = (
         "projection"
@@ -677,6 +768,7 @@ def ask_database(question: str, *, target_table: str | None = None) -> AgentResu
                 repaired,
                 prompt=prompt,
                 question=question,
+                schema_has_banking_details=schema_has_banking_details,
             )
             normalized_data = _projection_data(
                 data,
@@ -720,33 +812,39 @@ def ask_database(question: str, *, target_table: str | None = None) -> AgentResu
             f"{' for each series' if grouped_projection else ''}.\n"
             f"Projection: {_result_text(answer_data)}"
         )
-        try:
-            answer = _chat(
-                ANSWER_SYSTEM_PROMPT,
-                answer_context,
-                temperature=0.1,
-            ).strip()
-        except Exception:
-            if grouped_projection:
-                final_period = answer_data["period"].max()
-                winner = (
-                    answer_data[answer_data["period"] == final_period]
-                    .sort_values("projected_value", ascending=False)
-                    .iloc[0]
-                )
-                answer = (
-                    f"{winner['series']} is expected to have the most "
-                    f"enrollments in {final_period.strftime('%B %Y')}, with a "
-                    f"trend-based estimate of "
-                    f"{winner['projected_value']:,.0f}."
-                )
-            else:
+        answer_start = time.perf_counter()
+        if grouped_projection:
+            final_period = answer_data["period"].max()
+            winner = (
+                answer_data[answer_data["period"] == final_period]
+                .sort_values("projected_value", ascending=False)
+                .iloc[0]
+            )
+            metric = "contributions" if re.search(
+                r"\b(contribution|contributions)\b", question, re.IGNORECASE
+            ) else "records"
+            answer = (
+                f"{winner['series']} is expected to process the most {metric} "
+                f"in {final_period.strftime('%B %Y')}, with a trend-based "
+                f"estimate of {winner['projected_value']:,.0f}."
+            )
+        else:
+            try:
+                answer = _chat(
+                    ANSWER_SYSTEM_PROMPT,
+                    answer_context,
+                    temperature=0.1,
+                ).strip()
+            except Exception:
                 final_row = answer_data.iloc[-1]
                 answer = (
                     f"The trend-based estimate for "
                     f"{final_row['period'].strftime('%B %Y')} is "
                     f"{final_row['projected_value']:,.0f}."
                 )
+        timings["answer_generation"] = _elapsed(answer_start)
+        timings["total"] = _elapsed(total_start)
+        _LOGGER.info("ask_database timings (projection): %s", timings)
         return AgentResult(
             answer=answer,
             sql=sql,
@@ -757,23 +855,32 @@ def ask_database(question: str, *, target_table: str | None = None) -> AgentResu
             x_column="period",
             y_column="projected_value",
             chart_data=projection.chart_data,
+            timings=timings,
         )
 
-    try:
-        answer = _chat(
-            ANSWER_SYSTEM_PROMPT,
-            f"Analysis type: query\n"
-            f"Question: {question}\n"
-            f"SQL: {sql}\n"
-            f"Result: {_result_text(data)}",
-            temperature=0.1,
-        ).strip()
-    except Exception:
-        answer = (
-            "No matching records were found."
-            if data.empty
-            else f"The query returned {len(data):,} result row(s)."
-        )
+    answer_start = time.perf_counter()
+    deterministic_answer = _deterministic_answer(data)
+    if deterministic_answer is not None:
+        answer = deterministic_answer
+    else:
+        try:
+            answer = _chat(
+                ANSWER_SYSTEM_PROMPT,
+                f"Analysis type: query\n"
+                f"Question: {question}\n"
+                f"SQL: {sql}\n"
+                f"Result: {_result_text(data)}",
+                temperature=0.1,
+            ).strip()
+        except Exception:
+            answer = (
+                "No matching records were found."
+                if data.empty
+                else f"The query returned {len(data):,} result row(s)."
+            )
+    timings["answer_generation"] = _elapsed(answer_start)
+    timings["total"] = _elapsed(total_start)
+    _LOGGER.info("ask_database timings: %s", timings)
 
     chart_type, x_column, y_column, chart_title = _chart_settings(generated, data)
     return AgentResult(
@@ -785,4 +892,5 @@ def ask_database(question: str, *, target_table: str | None = None) -> AgentResu
         x_column=x_column,
         y_column=y_column,
         chart_data=data if chart_type != "none" else None,
+        timings=timings,
     )
